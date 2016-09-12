@@ -20,11 +20,22 @@ import (
 // The API URL to use for requests
 var APIUrl = "https://http-observatory.security.mozilla.org/api/v1/"
 
+// Maximum amount of time we will wait for a scan to complete
+var MaxWait = time.Second * 300
+
+// Time between polls
+var PollInterval = time.Second * 5
+
 type HTTPObsTime struct{ time.Time }
 
 // We require custom unmarshalling to handle the data formats returned by the
 // HTTP observatory API
 func (t *HTTPObsTime) UnmarshalJSON(b []byte) (err error) {
+	var zeroTime time.Time
+	if string(b) == "null" {
+		t.Time = zeroTime
+		return
+	}
 	t.Time, err = time.Parse("\"Mon, 2 Jan 2006 15:04:05 MST\"", string(b))
 	return
 }
@@ -52,24 +63,37 @@ type ScanObject struct {
 //
 // If rescan is true, this informs the API to conduct a new scan of the host and
 // not return any cached results from a recent scan of the same host.
-func RunScan(hostname string, hidden bool, rescan bool) (results ScanObject, err error) {
+func RunScan(hostname string, hidden bool, rescan bool) (ScanObject, error) {
+	var results ScanObject
 	u := APIUrl + fmt.Sprintf("analyze?host=%v", url.QueryEscape(hostname))
 
 	form := url.Values{}
 	form.Add("hidden", fmt.Sprintf("%v", hidden))
 	form.Add("rescan", fmt.Sprintf("%v", rescan))
 
-	res, err := http.PostForm(u, form)
-	if err != nil {
-		return
+	start := time.Now()
+	for {
+		res, err := http.PostForm(u, form)
+		if err != nil {
+			return results, err
+		}
+		err = json.NewDecoder(res.Body).Decode(&results)
+		if err != nil {
+			return results, err
+		}
+		res.Body.Close()
+		if results.Error != "" {
+			err = fmt.Errorf("httpobsgo: %v", results.Error)
+			return results, err
+		}
+		if results.State == "FINISHED" {
+			break
+		}
+		if time.Now().Sub(start) > MaxWait {
+			err = fmt.Errorf("httpobsgo: maximum scan duration exceeded")
+			return results, err
+		}
+		time.Sleep(PollInterval)
 	}
-	err = json.NewDecoder(res.Body).Decode(&results)
-	if err != nil {
-		return
-	}
-	res.Body.Close()
-	if results.Error != "" {
-		err = fmt.Errorf("httpobsgo: %v", results.Error)
-	}
-	return
+	return results, nil
 }
